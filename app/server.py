@@ -7,15 +7,19 @@ Endpoints
     POST /api/links              {"name": ...} -> create link
     GET  /api/links/{id}         link state (highest extended seq + bitmap)
     POST /api/links/{id}/frames   submit an arriving frame
+    GET  /api/audit              audit MMR state (leaf count, root, peaks)
+    GET  /api/receipts/{id}      leaf + global seq + current root + minimal
+                                 inclusion path for one stable receipt id
 
 Frame body: {"counter": <u32>, "receipt_id": "...", "payload": ...}
-Verdict:    {"status": "accepted|duplicate|expired|rejected", ...}
+Verdict:    {"status": "accepted|duplicate|expired|rejected",
+             "audit": {"seq": <global leaf index>, "root": <hex>}, ...}
 """
 
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .db import Database, ReceiptConflict
 
@@ -64,6 +68,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok"})
         elif path == "/api/links":
             self._send_json(200, {"links": self._db().list_links()})
+        elif path == "/api/audit":
+            self._send_json(200, self._db().audit_state())
+        elif path.startswith("/api/receipts/"):
+            receipt_id = unquote(path[len("/api/receipts/"):])
+            record = self._db().get_receipt_audit(receipt_id)
+            if record is None:
+                self._send_json(404, {"error": "unknown receipt id"})
+            else:
+                self._send_json(200, record)
         elif path.startswith("/api/links/"):
             link_id = path.split("/")[3]
             link = self._db().get_link(link_id)

@@ -27,6 +27,19 @@ candidate(k) = counter + k·2³²,   k ∈ (epoch−1, epoch, epoch+1)
 - `receipt_id` 全局唯一；复用标识但改变**链路、计数或载荷** → HTTP `409` 拒绝，且不改动窗口
 - 每次到达都在**同一个 SQLite `BEGIN IMMEDIATE` 事务**内读取并写入窗口状态与回执记录，配合写锁使并发到达串行化，窗口与回执不可能出现不一致
 
+## 裁决审计 · 可恢复的 Merkle 山脉（MMR）
+
+每份**首次完成**的帧裁决都在**窗口与回执的同一事务内**追加一叶到全局只增审计日志；命中原回执的重传只返回原叶，标识冲突不追加叶。叶内容（紧凑、键排序的规范 JSON，v=1）绑定：
+
+```
+seq（全局叶序号）· link · receipt · counter · payload_hash · status · highest（裁决后的最高扩展序号）
+```
+
+- 叶按 Merkle 山脉维护：高度相同的峰随追加自动合并，峰集合（范围峰）与当前根持久化在 SQLite，服务重启时**从已提交叶重建**派生态；若出现「有裁决无叶 / 叶指向不存在裁决 / 序号断档 / 叶内容与哈希不符」，启动直接拒绝而不是悄悄改写历史。
+- 哈希域分离：`H("leaf", 规范JSON)`、`H("node", 左, 右)`、`H("root", acc, 下一个峰)`、空日志 `H("root","empty")`。
+- 值班员可从页面或 `GET /api/receipts/{id}` 读取该回执的**全局序号、当前根、峰集合与最小包含路径**（叶→峰兄弟路径 + 其余峰）；页面用 WebCrypto **独立重算**叶哈希、路径与根并逐项显示比对结果。新裁决继续加入后，旧叶仍可用**最新根**复验——叶不可变，只是被折进了更新的根。
+- 并发提交由同一把写锁 + 单事务串行化：叶序号、前序峰和根只有一种提交顺序。事务中途失败整体回滚（窗口、回执、叶、峰、根同生共死）。
+
 ## 运行（Docker Compose）
 
 ```bash
@@ -43,7 +56,7 @@ HOST_PORT=9090 docker compose up --build
 
 ## 验收（verify 服务）
 
-`verify` 服务等待 `web` 健康后执行：构建检查（compileall）→ 全部代码测试（回绕/过期/重复/并列/回执/重启/并发）→ 对运行中的服务做 HTTP 冒烟，然后退出：
+`verify` 服务等待 `web` 健康后执行：构建检查（compileall）→ 全部代码测试（回绕/过期/重复/并列/回执/MMR 审计/重启/并发）→ 对运行中的服务做 HTTP 冒烟（含按最新根独立验证审计叶），然后退出：
 
 ```bash
 docker compose up --build --abort-on-container-exit verify
@@ -62,6 +75,8 @@ echo $?   # 0 = 验收通过，非 0 = 失败
 | `GET` | `/api/links` | 列出链路及窗口状态 |
 | `GET` | `/api/links/{id}` | 当前最高扩展序号、位图、最近 64 个已接受位置 |
 | `POST` | `/api/links/{id}/frames` | 提交到达帧 |
+| `GET` | `/api/audit` | 审计 MMR：叶总数、当前根、范围峰集合 |
+| `GET` | `/api/receipts/{receipt_id}` | 该回执的全局序号、叶内容、当前根、最小包含路径 |
 
 提交帧请求体：
 
@@ -78,7 +93,21 @@ echo $?   # 0 = 验收通过，非 0 = 失败
   "counter": 4294967295,
   "extended": 4294967295,        // 解析出的 64 位扩展序号
   "highest": 4294967295,         // 当前最高扩展序号
-  "recent": [4294967295]         // 最近 64 个已接受位置（新→旧）
+  "recent": [4294967295],        // 最近 64 个已接受位置（新→旧）
+  "audit": { "seq": 1, "root": "…" }
+}
+```
+
+回执审计记录（`GET /api/receipts/{receipt_id}`）：
+
+```json
+{
+  "seq": 1, "leaf_count": 13, "root": "…", "peak_height": 3,
+  "leaf": {"seq": 1, "link": "…", "receipt": "tx-0001", "counter": 4294967295,
+           "payload_hash": "…", "status": "accepted", "highest": 4294967295,
+           "hash": "…"},
+  "path": [{"side": "right", "hash": "…"}],
+  "peaks": [{"height": 3, "position": 0, "hash": "…"}, {"height": 2, "position": 8, "hash": "…"}]
 }
 ```
 
@@ -94,10 +123,11 @@ python3 scripts/smoke.py http://127.0.0.1:8080    # 端到端冒烟
 
 ```
 app/window.py        # 纯函数：纪元候选、距离并列、滑动窗口位图裁决
-app/db.py            # SQLite：窗口状态 + 回执记录，单事务一致推导
+app/audit.py         # 纯函数：审计叶规范哈希、MMR 追加/峰布局/包含路径与独立验证
+app/db.py            # SQLite：窗口状态 + 回执 + 审计叶/峰/根，单事务一致推导与重启恢复
 app/server.py        # 标准库 HTTP 服务与 JSON API
-app/static/index.html# 单页界面
-tests/               # 算法 / 持久化 / 回执 / 重启 / 并发 / HTTP 测试
+app/static/index.html# 单页界面（含 WebCrypto 独立复验审计叶）
+tests/               # 算法 / MMR / 持久化 / 回执 / 审计 / 重启 / 并发 / HTTP 测试
 scripts/smoke.py     # 针对运行服务的端到端冒烟
 scripts/verify.sh    # Compose verify 入口（退出码即验收结论）
 ```

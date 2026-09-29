@@ -11,6 +11,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, ".")
+from app import audit
+
 MOD = 1 << 32
 HALF = 1 << 31
 
@@ -44,6 +47,14 @@ def main(base):
     else:
         raise RuntimeError("server never became healthy")
     print("ok - healthz reports ok")
+
+    code, empty = request("GET", base + "/api/audit")
+    check(code == 200 and len(empty["root"]) == 64
+          and empty["leaf_count"] >= 0
+          and (empty["leaf_count"] != 0
+               or empty["root"] == audit.EMPTY_ROOT),
+          "audit endpoint exposes leaf count, peaks and the empty-root convention")
+    n_before = empty["leaf_count"]
 
     _, link = request("POST", base + "/api/links", {"name": "smoke-wrap"})
     lid = link["id"]
@@ -115,6 +126,98 @@ def main(base):
     code, _ = request("POST", f"{base}/api/links/deadbeef/frames",
                       {"counter": 1, "receipt_id": "x", "payload": {}})
     check(code == 404, "unknown link -> 404")
+
+    # ============================================================ audit MMR
+    def verify_record(rec):
+        fields = {k: rec["leaf"][k] for k in
+                  ("seq", "link", "receipt", "counter", "payload_hash",
+                   "status", "highest")}
+        return audit.verify_inclusion(
+            fields, rec["path"], rec["peaks"], rec["root"],
+            rec["leaf_count"])
+
+    code, state_now = request("GET", base + "/api/audit")
+    check(code == 200 and len(state_now["root"]) == 64,
+          "audit endpoint still serves a 256-bit root after verdicts")
+    n_before = state_now["leaf_count"]
+
+    # all wrap frames above produced leaves; an early receipt's record proves
+    code, rec_s2 = request("GET", base + "/api/receipts/s-2")
+    check(code == 200 and verify_record(rec_s2),
+          f"receipt s-2 leaf verifies against current root (#{rec_s2['seq']})")
+    anchor_root = rec_s2["root"]
+    anchor_seq = rec_s2["seq"]
+
+    # retransmission returns the original leaf, conflict appends none
+    _, replay = request("POST", frames_url,
+                        {"counter": MOD - 2, "receipt_id": "s-2",
+                         "payload": {"v": 1}})
+    check(replay["retransmit"] and replay["audit"]["seq"] == anchor_seq,
+          "retransmit serves the original audit leaf seq")
+    code, state = request("GET", base + "/api/audit")
+    check(state["root"] == anchor_root, "no new root after retransmit")
+
+    # expired and rejected first verdicts also carry leaves
+    code, rec_late = request("GET", base + "/api/receipts/s-2-late")
+    check(code == 200 and rec_late["leaf"]["status"] == "expired"
+          and verify_record(rec_late), "expired verdict leaf verifies")
+    code, rec_tie = request("GET", base + "/api/receipts/th")
+    check(code == 200 and rec_tie["leaf"]["status"] == "rejected"
+          and verify_record(rec_tie), "rejected verdict leaf verifies")
+
+    # leaf content really binds the post-verdict highest extended seq
+    check(rec_s2["leaf"]["highest"] == rec_s2["leaf"]["counter"] == MOD - 2,
+          "leaf binds link/counter/payload/status/post-verdict highest")
+
+    # keep the anchor record, advance the log with fresh verdicts, then prove
+    # the SAME leaf independently under the NEWEST root
+    _, adv = request("POST", base + "/api/links", {"name": "smoke-audit"})
+    appended = 0
+    for i in range(1, 21):
+        code, v = request("POST", f"{base}/api/links/{adv['id']}/frames",
+                          {"counter": i, "receipt_id": f"au-{i:02d}",
+                           "payload": {"v": i}})
+        if code == 200 and v["audit"]["seq"] > 0:
+            appended += 1
+    check(appended == 20, "20 later verdicts each append an audit leaf")
+    code, moved = request("GET", base + "/api/receipts/s-2")
+    check(moved["leaf_count"] > rec_s2["leaf_count"],
+          "audit log grew after later verdicts")
+    check(moved["root"] != anchor_root, "current root advanced")
+    check(verify_record(moved),
+          "old leaf independently verifies under the newest root")
+
+    # every served record must verify under the root served with it
+    for rid in ("s-1", "s0", "s1", "s70", "au-01", "au-13", "au-20"):
+        code, rec = request("GET", base + "/api/receipts/" + rid)
+        check(code == 200 and verify_record(rec), f"leaf {rid} verifies")
+
+    # unknown receipt -> 404; concurrent submissions get one total order
+    code, _ = request("GET", base + "/api/receipts/does-not-exist")
+    check(code == 404, "unknown receipt id -> 404")
+
+    import concurrent.futures
+    _, race = request("POST", base + "/api/links", {"name": "smoke-race"})
+
+    def race_frame(i):
+        return request("POST", f"{base}/api/links/{race['id']}/frames",
+                       {"counter": 100 + i, "receipt_id": f"race-{i:03d}",
+                        "payload": {}})[1]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+        verdicts = list(pool.map(race_frame, range(48)))
+    seqs = sorted(v["audit"]["seq"] for v in verdicts)
+    check(len(seqs) == 48 and seqs == list(range(min(seqs), min(seqs) + 48)),
+          "concurrent commits serialise into one contiguous seq order")
+    code, end_state = request("GET", base + "/api/audit")
+    check(end_state["leaf_count"] > n_before and end_state["root"],
+          f"audit log has {end_state['leaf_count']} leaves and a current root")
+    # all raced leaves verify under the final committed root, unique seq each
+    race_ok = 0
+    for i in range(48):
+        code, rec = request("GET", base + "/api/receipts/" + f"race-{i:03d}")
+        if code == 200 and verify_record(rec):
+            race_ok += 1
+    check(race_ok == 48, "all 48 raced leaves verify under the final root")
 
     print("\nALL SMOKE CHECKS PASSED")
 

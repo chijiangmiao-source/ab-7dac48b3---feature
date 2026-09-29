@@ -70,6 +70,19 @@
   .hint { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
   #verdict { margin-top: 10px; font-size: 12.5px; min-height: 18px; }
+  .mono2 { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+           font-size: 11px; word-break: break-all; color: var(--muted); }
+  .audit-grid { display: grid; grid-template-columns: 360px 1fr; gap: 16px;
+                padding: 0 24px 24px; }
+  .verify-ok { color: var(--ok); font-weight: 700; }
+  .verify-bad { color: var(--exp); font-weight: 700; }
+  .kv { display: grid; grid-template-columns: 92px 1fr; gap: 4px 10px;
+        font-size: 12px; margin-top: 8px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-family: ui-monospace, monospace; word-break: break-all; }
+  .path-node { font-family: ui-monospace, monospace; font-size: 10.5px;
+               color: var(--muted); word-break: break-all; margin: 3px 0; }
+  .path-node .side { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -96,6 +109,24 @@
 
   <div class="panel" id="main-panel">
     <div class="empty">请选择或创建一条链路</div>
+  </div>
+</div>
+
+<div class="audit-grid">
+  <div class="panel">
+    <h2>裁决审计 · Merkle 山脉回执</h2>
+    <label for="a-receipt">稳定回执标识 receipt_id</label>
+    <input id="a-receipt" placeholder="例如 tx-0001">
+    <button onclick="lookupReceipt()">读取该回执的审计叶</button>
+    <div class="hint">每个首次裁决在同一 SQLite 事务内追加一叶；重传返回原叶、
+    标识冲突不追加叶。叶绑定：链路 / 回执 / 计数 / 载荷摘要 / 裁决 / 裁决后最高扩展序号。</div>
+    <div class="kv" id="a-state" style="margin-top:14px"></div>
+    <button class="secondary" onclick="loadAuditState()" style="margin-top:10px">刷新当前根</button>
+  </div>
+
+  <div class="panel" id="audit-detail">
+    <div class="empty">输入回执标识以读取全局序号、当前根与最小包含路径。<br>
+    稍后新裁决加入后，旧叶仍可凭最新根在此页面独立复验。</div>
   </div>
 </div>
 
@@ -220,7 +251,11 @@ async function submitFrame() {
   const label = { accepted: "接受", duplicate: "重复", expired: "过期", rejected: "拒绝(纪元并列)" }[d.status];
   box.innerHTML = `<span class="badge ${d.status}">${label}</span>
     扩展序号 <b>${d.extended}</b> · 最高 <b>${d.highest}</b>
-    ${d.retransmit ? "· 重传回放首次裁决" : ""}`;
+    ${d.retransmit ? "· 重传回放首次裁决" : ""}
+    · 审计叶 <b>#${d.audit.seq}</b>
+    <a href="#" onclick="document.getElementById('a-receipt').value=${JSON.stringify(receipt)};lookupReceipt();return false;"
+       style="color:var(--accent)">查看包含证明</a>
+    <div class="mono2" style="margin-top:3px">当前根 ${d.audit.root}</div>`;
   const fresh = await api("GET", "/api/links/" + currentLink);
   if (fresh.ok) refreshState(fresh.data);
 }
@@ -230,7 +265,162 @@ function setVerdict(msg) {
     `<span class="badge rejected">${escapeHtml(msg)}</span>`;
 }
 
+// ============================================================ audit console
+
+async function loadAuditState() {
+  const r = await api("GET", "/api/audit");
+  const box = document.getElementById("a-state");
+  if (!r.ok) { box.innerHTML = `<div class="k">审计状态读取失败</div>`; return; }
+  box.innerHTML = `
+    <div class="k">叶总数</div><div class="v">${r.data.leaf_count}</div>
+    <div class="k">当前根</div><div class="v">${r.data.root}</div>
+    <div class="k">峰数量</div><div class="v">${r.data.peaks.length}</div>`;
+  return r.data;
+}
+
+function peakLayout(n) {
+  const out = [];
+  let pos = 0;
+  for (let h = Math.max(0, n.toString(2).length - 1); h >= 0; h--) {
+    const size = 1 << h;
+    if (n & size) { out.push({height: h, position: pos}); pos += size; }
+  }
+  return out;
+}
+
+function containingPeak(seq, n) {
+  const idx = seq - 1;
+  return peakLayout(n).find(p =>
+    p.position <= idx && idx < p.position + (1 << p.height));
+}
+
+// Sibling coordinates leaf -> peak, derived independently from seq/count.
+function siblingSides(seq, peak) {
+  let idx = seq - 1 - peak.position;
+  let pos = peak.position + idx;
+  const steps = [];
+  for (let h = 0; h < peak.height; h++) {
+    const step = 1 << h;
+    if (idx & step) { steps.push({side: "left"}); pos -= step; }
+    else steps.push({side: "right"});
+  }
+  return steps;
+}
+
+function canonicalLeaf(f) {
+  // Must match audit.canonical_leaf_blob (sort_keys + compact separators):
+  // counter, highest, link, payload_hash, receipt, seq, status, v
+  const q = v => JSON.stringify(String(v));
+  return `{"counter":${f.counter},"highest":${f.highest},"link":${q(f.link)},` +
+         `"payload_hash":${q(f.payload_hash)},"receipt":${q(f.receipt)},` +
+         `"seq":${f.seq},"status":${q(f.status)},"v":1}`;
+}
+
+async function sha256Hex(kind, parts) {
+  const enc = new TextEncoder();
+  let bytes = Array.from(enc.encode(kind));
+  for (const part of parts) {
+    bytes.push(0);
+    bytes = bytes.concat(Array.from(enc.encode(part)));
+  }
+  const digest = await crypto.subtle.digest("SHA-256", new Uint8Array(bytes));
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyRecord(rec) {
+  // Fully independent recomputation: leaf hash, sibling path, peak fold.
+  const f = rec.leaf;
+  const leafHash = await sha256Hex("leaf", [canonicalLeaf(f)]);
+  const leafHashOk = leafHash === f.hash;
+
+  const peak = containingPeak(rec.seq, rec.leaf_count);
+  const expectedSides = siblingSides(rec.seq, peak);
+  const pathShapeOk = rec.path.length === expectedSides.length &&
+    rec.path.every((p, i) => p.side === expectedSides[i].side);
+
+  const layout = peakLayout(rec.leaf_count);
+  const peaksShapeOk = rec.peaks.length === layout.length &&
+    rec.peaks.every((p, i) => p.height === layout[i].height &&
+                              p.position === layout[i].position);
+
+  let node = leafHash;
+  for (const step of rec.path) {
+    node = step.side === "right"
+      ? await sha256Hex("node", [node, step.hash])
+      : await sha256Hex("node", [step.hash, node]);
+  }
+  const folded = rec.peaks.map(p =>
+    (p.height === peak.height && p.position === peak.position) ? node : p.hash);
+  let acc = null;
+  for (const hsh of folded) {
+    acc = acc === null ? hsh : await sha256Hex("root", [acc, hsh]);
+  }
+  if (rec.leaf_count === 0) acc = await sha256Hex("root", ["empty"]);
+  const rootOk = acc === rec.root;
+
+  return {leafHashOk, pathShapeOk, peaksShapeOk, rootOk,
+          valid: leafHashOk && pathShapeOk && peaksShapeOk && rootOk,
+          recomputedRoot: acc};
+}
+
+async function lookupReceipt() {
+  const rid = document.getElementById("a-receipt").value.trim();
+  const box = document.getElementById("audit-detail");
+  if (!rid) { box.innerHTML = `<div class="empty">请输入 receipt_id</div>`; return; }
+  const r = await api("GET", "/api/receipts/" + encodeURIComponent(rid));
+  if (r.status === 404) {
+    box.innerHTML = `<div class="empty">该回执标识尚无审计叶（未知标识或仅冲突提交）。</div>`;
+    return;
+  }
+  if (!r.ok) {
+    box.innerHTML = `<div class="empty verify-bad">读取失败: ${escapeHtml(r.data.error || "")}</div>`;
+    return;
+  }
+  const rec = r.data;
+  const verdictLabels =
+    {accepted: "接受", duplicate: "重复", expired: "过期", rejected: "拒绝(纪元并列)"};
+  const res = await verifyRecord(rec);
+  const stamp = new Date().toLocaleTimeString();
+  box.innerHTML = `
+    <h2 style="margin-top:0">审计叶 #${rec.seq}
+      <span class="badge ${rec.leaf.status}">${verdictLabels[rec.leaf.status] || rec.leaf.status}</span>
+      <span class="${res.valid ? "verify-ok" : "verify-bad"}">
+        ${res.valid ? "✓ 页面独立验证通过" : "✗ 验证失败"}</span></h2>
+    <div class="kv">
+      <div class="k">receipt</div><div class="v">${escapeHtml(rec.leaf.receipt)}</div>
+      <div class="k">link</div><div class="v">${escapeHtml(rec.leaf.link)}</div>
+      <div class="k">counter</div><div class="v">${rec.leaf.counter}</div>
+      <div class="k">payload</div><div class="v">${rec.leaf.payload_hash}</div>
+      <div class="k">裁决后最高</div><div class="v">${rec.leaf.highest}</div>
+      <div class="k">叶哈希</div><div class="v">${rec.leaf.hash}</div>
+      <div class="k">当前叶总数</div><div class="v">${rec.leaf_count}</div>
+      <div class="k">当前根</div><div class="v">${rec.root}</div>
+      <div class="k">所在峰</div><div class="v">height=${rec.peak_height}，路径长 ${rec.path.length}（最小包含路径）</div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px">
+      <div>
+        <h2>同层兄弟路径（叶 → 峰）</h2>
+        ${rec.path.map(p => `<div class="path-node"><span class="side">[${p.side}]</span> ${p.hash}</div>`).join("")
+          || '<div class="empty">叶本身即峰，路径为空</div>'}
+      </div>
+      <div>
+        <h2>峰集合（按时间序折叠为根）</h2>
+        ${rec.peaks.map(p => `<div class="path-node">h${p.height}@${p.position} ${p.hash}</div>`).join("")}
+      </div>
+    </div>
+    <div class="hint" style="margin-top:10px">
+      复算根：<span class="mono2">${res.recomputedRoot}</span><br>
+      叶哈希一致：${res.leafHashOk ? "是" : "否"} · 路径坐标一致：${res.pathShapeOk ? "是" : "否"}
+      · 峰布局一致：${res.peaksShapeOk ? "是" : "否"} · 根一致：${res.rootOk ? "是" : "否"}
+      （复验时刻 ${stamp}）
+    </div>
+    <button onclick="lookupReceipt()" style="margin-top:10px">以最新根再次独立复验</button>`;
+  await loadAuditState();
+}
+
 loadLinks();
+loadAuditState();
 </script>
 </body>
 </html>
