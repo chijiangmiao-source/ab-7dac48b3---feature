@@ -5,6 +5,7 @@ Asserts wrap-around, expiry, duplicate, epoch-tie rejection and receipt
 semantics against a fully running server, and exits non-zero on any failure.
 """
 
+import hashlib
 import json
 import sys
 import time
@@ -31,6 +32,45 @@ def check(cond, msg):
     if not cond:
         raise AssertionError(msg)
     print(f"  ok - {msg}")
+
+
+# Independent MMR inclusion verifier: recomputes every hash from the served
+# JSON instead of trusting any server-side code.
+def _h(domain, *parts):
+    m = hashlib.sha256()
+    m.update(domain)
+    for p in parts:
+        m.update(p)
+    return m.hexdigest()
+
+
+def _node(left_hex, right_hex):
+    return _h(b"DSRX1\x00NODE\x00", bytes.fromhex(left_hex),
+              bytes.fromhex(right_hex))
+
+
+def _bag(peaks, self_index, acc):
+    left, right = peaks[:self_index], peaks[self_index + 1:]
+    if right:
+        bag = right[-1][0]
+        for sibling, _h2 in reversed(right[:-1]):
+            bag = _node(sibling, bag)
+        acc = _node(acc, bag)
+    for sibling, _h2 in reversed(left):
+        acc = _node(sibling, acc)
+    return acc
+
+
+def verify_proof(audit):
+    """Recompute the root from one leaf + its served path and compare."""
+    acc = audit["leaf_hash"]
+    for side, _height, sibling in audit["steps"]:
+        acc = _node(sibling, acc) if side == "left" else _node(acc, sibling)
+    peaks = [(p["hash"], p["height"]) for p in audit["peaks"]]
+    matches = [i for i, (digest, _h2) in enumerate(peaks) if digest == acc]
+    if len(matches) != 1:
+        return False
+    return _bag(peaks, matches[0], acc) == audit["root"]
 
 
 def main(base):
@@ -115,6 +155,67 @@ def main(base):
     code, _ = request("POST", f"{base}/api/links/deadbeef/frames",
                       {"counter": 1, "receipt_id": "x", "payload": {}})
     check(code == 404, "unknown link -> 404")
+
+    # --- MMR audit trail: first verdict -> canonical leaf, replay-safe ---
+    _, aud_link = request("POST", base + "/api/links", {"name": "smoke-audit"})
+    alid = aud_link["id"]
+
+    def audit(rid):
+        return request("GET", f"{base}/api/links/{alid}/receipts/{rid}")
+
+    code, a1 = request("POST", f"{base}/api/links/{alid}/frames",
+                       {"counter": 10, "receipt_id": "au1", "payload": {"z": 1}})
+    check(a1["leaf_seq"] == a1["leaf_count"], "verdict reports its global leaf seq")
+    seq1 = a1["leaf_seq"]
+    root1 = a1["root"]
+
+    code, leaf1 = audit("au1")
+    check(code == 200, "audit leaf readable from the link page")
+    check(leaf1["seq"] == seq1 and leaf1["counter"] == 10
+          and leaf1["status"] == "accepted" and leaf1["highest"] == 10,
+          "leaf binds link, receipt, counter, verdict and post-verdict highest")
+    check(leaf1["leaf_count"] == a1["leaf_count"], "leaf reports range size")
+    check(verify_proof(leaf1), "minimal inclusion path verifies under current root")
+
+    # retransmission returns the original leaf, no new append
+    code, replay_v = request("POST", f"{base}/api/links/{alid}/frames",
+                             {"counter": 10, "receipt_id": "au1", "payload": {"z": 1}})
+    check(replay_v["retransmit"] and replay_v["leaf_seq"] == seq1,
+          "retransmission returns the original leaf seq")
+    _, leaf1b = audit("au1")
+    check(leaf1b["leaf_hash"] == leaf1["leaf_hash"], "replay leaf hash unchanged")
+
+    # conflicting reuse must not append a leaf
+    _, tip_before = request("GET", base + "/api/audit/root")
+    code, _ = request("POST", f"{base}/api/links/{alid}/frames",
+                      {"counter": 11, "receipt_id": "au1", "payload": {"z": 1}})
+    check(code == 409, "audit: receipt reuse -> 409")
+    _, tip_after = request("GET", base + "/api/audit/root")
+    check(tip_after == tip_before, "conflict appends no audit leaf")
+
+    # after newer verdicts join, the old leaf still verifies under the newest
+    # root using a freshly served (current-peaks) minimal path
+    for i in range(11, 24):
+        code, v = request("POST", f"{base}/api/links/{alid}/frames",
+                          {"counter": i, "receipt_id": f"au{i}", "payload": {}})
+        check(code == 200, f"audit growth frame {i} accepted")
+    _, tip = request("GET", base + "/api/audit/root")
+    _, leaf1_now = audit("au1")
+    check(leaf1_now["root"] == tip["root"], "leaf page shows newest root")
+    check(leaf1_now["leaf_hash"] == leaf1["leaf_hash"]
+          and leaf1_now["seq"] == seq1, "leaf identity immutable after growth")
+    check(verify_proof(leaf1_now), "old leaf independently verifies under newest root")
+
+    # every leaf in the range verifies independently
+    for rid in ["au1"] + [f"au{i}" for i in range(11, 24)]:
+        _, lf = audit(rid)
+        check(verify_proof(lf), f"leaf {rid} inclusion proof verifies")
+
+    # unknown receipt / wrong link -> 404
+    code, _ = audit("does-not-exist")
+    check(code == 404, "unknown receipt -> 404")
+    code, _ = request("GET", f"{base}/api/links/{lid}/receipts/au1")
+    check(code == 404, "receipt of another link is not readable on this link")
 
     print("\nALL SMOKE CHECKS PASSED")
 

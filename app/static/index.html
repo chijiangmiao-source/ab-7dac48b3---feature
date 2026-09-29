@@ -70,6 +70,19 @@
   .hint { color: var(--muted); font-size: 11.5px; margin-top: 6px; }
   .empty { color: var(--muted); padding: 20px; text-align: center; }
   #verdict { margin-top: 10px; font-size: 12.5px; min-height: 18px; }
+  .audit-bar {
+    display: flex; gap: 12px; flex-wrap: wrap; align-items: center;
+    margin: 0 24px 16px; padding: 12px 16px; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 10px;
+  }
+  .audit-bar .k { color: var(--muted); font-size: 11px; }
+  .audit-bar .v {
+    font-family: ui-monospace, monospace; font-size: 12.5px; margin-top: 2px;
+    word-break: break-all;
+  }
+  .proof-line { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); word-break: break-all; margin: 3px 0; }
+  .verify-ok { color: var(--ok); font-weight: 700; }
+  .verify-bad { color: var(--exp); font-weight: 700; }
 </style>
 </head>
 <body>
@@ -96,6 +109,25 @@
 
   <div class="panel" id="main-panel">
     <div class="empty">请选择或创建一条链路</div>
+  </div>
+</div>
+
+<div class="audit-bar panel">
+  <div style="min-width:110px">
+    <div class="k">全局审计峰根 / 当前根</div>
+    <div class="v" id="audit-root" title="Merkle 山脉峰装根（hex）">—</div>
+  </div>
+  <div style="min-width:90px">
+    <div class="k">叶总数</div>
+    <div class="v" id="audit-count">—</div>
+  </div>
+  <div style="flex:1;min-width:220px">
+    <div class="k">独立验证回执（先选链路，再输入 receipt_id）</div>
+    <div style="display:flex;gap:8px">
+      <input id="audit-receipt" placeholder="例如 tx-0001" style="margin-top:2px">
+      <button style="width:auto;margin-top:2px;padding:8px 14px" onclick="verifyReceipt()">读取并独立计算根</button>
+    </div>
+    <div id="audit-result" style="margin-top:8px"></div>
   </div>
 </div>
 
@@ -220,9 +252,86 @@ async function submitFrame() {
   const label = { accepted: "接受", duplicate: "重复", expired: "过期", rejected: "拒绝(纪元并列)" }[d.status];
   box.innerHTML = `<span class="badge ${d.status}">${label}</span>
     扩展序号 <b>${d.extended}</b> · 最高 <b>${d.highest}</b>
-    ${d.retransmit ? "· 重传回放首次裁决" : ""}`;
+    ${d.retransmit ? "· 重传回放首次裁决" : ""}
+    · 审计叶 <b>#${d.leaf_seq}</b>`;
   const fresh = await api("GET", "/api/links/" + currentLink);
   if (fresh.ok) refreshState(fresh.data);
+  await loadAuditTip();
+}
+
+// ------------------------------------------------------------ MMR audit
+
+async function loadAuditTip() {
+  const r = await api("GET", "/api/audit/root");
+  if (!r.ok) return;
+  document.getElementById("audit-root").textContent = r.data.root;
+  document.getElementById("audit-count").textContent = String(r.data.leaf_count);
+}
+
+async function sha256Hex(bytes) {
+  const buf = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+function enc(s) { return new TextEncoder().encode(s); }
+
+async function nodeHash(leftHex, rightHex) {
+  const parts = [enc("DSRX1\x00NODE\x00")];
+  for (const hx of [leftHex, rightHex]) {
+    const u = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) u[i] = parseInt(hx.substr(i * 2, 2), 16);
+    parts.push(u);
+  }
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return sha256Hex(out);
+}
+
+// Recompute the peak-bagging root from one leaf hash + its served path,
+// entirely in the browser (no server verify code involved).
+async function recomputeRoot(a) {
+  let acc = a.leaf_hash;
+  for (const [side, , sibling] of a.steps) {
+    acc = side === "left" ? await nodeHash(sibling, acc)
+                          : await nodeHash(acc, sibling);
+  }
+  const peaks = a.peaks.map(p => p.hash);
+  const idx = peaks.indexOf(acc);
+  if (idx < 0) return null;
+  const left = peaks.slice(0, idx), right = peaks.slice(idx + 1);
+  if (right.length) {
+    let bag = right[right.length - 1];
+    for (let i = right.length - 2; i >= 0; i--) bag = await nodeHash(right[i], bag);
+    acc = await nodeHash(acc, bag);
+  }
+  for (let i = left.length - 1; i >= 0; i--) acc = await nodeHash(left[i], acc);
+  return acc;
+}
+
+async function verifyReceipt() {
+  const box = document.getElementById("audit-result");
+  const rid = document.getElementById("audit-receipt").value.trim();
+  if (!currentLink) { box.innerHTML = '<span class="verify-bad">请先选择链路</span>'; return; }
+  if (!rid) { box.innerHTML = '<span class="verify-bad">请输入 receipt_id</span>'; return; }
+  box.textContent = "读取叶与最小包含路径…";
+  if (!window.crypto || !crypto.subtle) {
+    box.innerHTML = '<span class="verify-bad">当前非安全上下文，浏览器无法使用 SHA-256（请经 localhost 或 HTTPS 访问）</span>';
+    return;
+  }
+  const r = await api("GET", `/api/links/${currentLink}/receipts/${encodeURIComponent(rid)}`);
+  if (!r.ok) { box.innerHTML = `<span class="verify-bad">HTTP ${r.status}：${escapeHtml(r.data.error || "")}</span>`; return; }
+  const a = r.data;
+  const computed = await recomputeRoot(a);
+  const ok = computed === a.root;
+  box.innerHTML = `
+    <div class="proof-line">全局序号 #${a.seq}（当前范围 ${a.leaf_count} 叶）· 裁决
+      <span class="badge ${a.status}">${a.status}</span> · counter ${a.counter} · 裁决后最高 ${a.highest}</div>
+    <div class="proof-line">leaf ${a.leaf_hash}</div>
+    <div class="proof-line">root ${a.root}</div>
+    <div class="${ok ? "verify-ok" : "verify-bad"}">
+      ${ok ? "✔ 浏览器独立重算根一致：该叶包含于当前根" : "✘ 重算根不一致：叶或路径与当前根不匹配（算出 " + computed + "）"}
+    </div>`;
 }
 
 function setVerdict(msg) {
@@ -231,6 +340,7 @@ function setVerdict(msg) {
 }
 
 loadLinks();
+loadAuditTip();
 </script>
 </body>
 </html>

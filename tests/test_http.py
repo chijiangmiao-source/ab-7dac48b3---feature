@@ -122,6 +122,94 @@ class TestHTTP(unittest.TestCase):
         self.assertEqual(code, 200)
         self.assertEqual(v["status"], "rejected")
 
+    # --------------------------------------------------------------- audit
+
+    def test_audit_root_tip_shape(self):
+        code, tip = _request("GET", self.base + "/api/audit/root")
+        self.assertEqual(code, 200)
+        self.assertIsInstance(tip["leaf_count"], int)
+        self.assertGreaterEqual(tip["leaf_count"], 0)
+        self.assertRegex(tip["root"], r"^[0-9a-f]{64}$")
+
+    def test_receipt_audit_endpoint_and_proof(self):
+        from app import merkle
+        code, link = _request("POST", self.base + "/api/links", {"name": "aud"})
+        lid = link["id"]
+        code, v = _request("POST", f"{self.base}/api/links/{lid}/frames",
+                           {"counter": 42, "receipt_id": "aud-1",
+                            "payload": {"x": 1}})
+        self.assertEqual(code, 200)
+        self.assertEqual(v["leaf_seq"], v["leaf_count"])
+
+        code, a = _request("GET", f"{self.base}/api/links/{lid}/receipts/aud-1")
+        self.assertEqual(code, 200)
+        self.assertEqual(a["seq"], v["leaf_seq"])
+        self.assertEqual(a["counter"], 42)
+        self.assertEqual(a["status"], "accepted")
+        self.assertEqual(a["highest"], 42)
+        self.assertEqual(a["link_id"], lid)
+        self.assertEqual(a["receipt_id"], "aud-1")
+        self.assertEqual(a["root"], v["root"])
+        self.assertTrue(merkle.verify_inclusion(
+            a["leaf_hash"],
+            [(s[0], s[1], s[2]) for s in a["steps"]],
+            [(p["height"], p["hash"]) for p in a["peaks"]],
+            a["root"]))
+
+        # retransmission returns the same leaf; path is still valid
+        _request("POST", f"{self.base}/api/links/{lid}/frames",
+                 {"counter": 42, "receipt_id": "aud-1", "payload": {"x": 1}})
+        code, a2 = _request("GET", f"{self.base}/api/links/{lid}/receipts/aud-1")
+        self.assertEqual(code, 200)
+        self.assertEqual(a2["seq"], a["seq"])
+        self.assertEqual(a2["leaf_hash"], a["leaf_hash"])
+
+    def test_older_leaf_verifies_under_newer_root_via_http(self):
+        from app import merkle
+        _, link = _request("POST", self.base + "/api/links", {"name": "grow"})
+        lid = link["id"]
+        _request("POST", f"{self.base}/api/links/{lid}/frames",
+                 {"counter": 1, "receipt_id": "g1", "payload": {}})
+        _, early = _request("GET", f"{self.base}/api/links/{lid}/receipts/g1")
+        for i in range(2, 12):
+            _request("POST", f"{self.base}/api/links/{lid}/frames",
+                     {"counter": i, "receipt_id": f"g{i}", "payload": {}})
+        _, tip = _request("GET", self.base + "/api/audit/root")
+        _, now = _request("GET", f"{self.base}/api/links/{lid}/receipts/g1")
+        self.assertEqual(now["root"], tip["root"])
+        self.assertEqual(now["leaf_hash"], early["leaf_hash"])
+        self.assertEqual(now["seq"], early["seq"])
+        # current minimal path re-derived against the newest peaks verifies
+        self.assertTrue(merkle.verify_inclusion(
+            now["leaf_hash"],
+            [(s[0], s[1], s[2]) for s in now["steps"]],
+            [(p["height"], p["hash"]) for p in now["peaks"]],
+            now["root"]))
+
+    def test_receipt_audit_scoped_to_link_and_404(self):
+        _, l1 = _request("POST", self.base + "/api/links", {"name": "a1"})
+        _, l2 = _request("POST", self.base + "/api/links", {"name": "a2"})
+        _request("POST", f"{self.base}/api/links/{l1['id']}/frames",
+                 {"counter": 1, "receipt_id": "only-on-l1", "payload": {}})
+        code, _ = _request(
+            "GET", f"{self.base}/api/links/{l2['id']}/receipts/only-on-l1")
+        self.assertEqual(code, 404)
+        code, _ = _request(
+            "GET", f"{self.base}/api/links/{l1['id']}/receipts/missing")
+        self.assertEqual(code, 404)
+
+    def test_conflict_appends_no_leaf_via_http(self):
+        _, link = _request("POST", self.base + "/api/links", {"name": "cf"})
+        lid = link["id"]
+        _request("POST", f"{self.base}/api/links/{lid}/frames",
+                 {"counter": 1, "receipt_id": "cf-1", "payload": {}})
+        _, before = _request("GET", self.base + "/api/audit/root")
+        code, _ = _request("POST", f"{self.base}/api/links/{lid}/frames",
+                           {"counter": 2, "receipt_id": "cf-1", "payload": {}})
+        self.assertEqual(code, 409)
+        _, after = _request("GET", self.base + "/api/audit/root")
+        self.assertEqual(after, before)
+
 
 if __name__ == "__main__":
     unittest.main()

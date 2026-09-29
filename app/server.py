@@ -15,7 +15,7 @@ Verdict:    {"status": "accepted|duplicate|expired|rejected", ...}
 import json
 import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from .db import Database, ReceiptConflict
 
@@ -59,18 +59,28 @@ class Handler(BaseHTTPRequestHandler):
     # ---------------------------------------------------------------- routing
 
     def do_GET(self):
-        path = urlparse(self.path).path
+        parsed = urlparse(self.path)
+        path = parsed.path
         if path == "/healthz":
             self._send_json(200, {"status": "ok"})
         elif path == "/api/links":
             self._send_json(200, {"links": self._db().list_links()})
         elif path.startswith("/api/links/"):
-            link_id = path.split("/")[3]
-            link = self._db().get_link(link_id)
-            if link is None:
-                self._send_json(404, {"error": "unknown link"})
+            parts = path.split("/")
+            # /api/links/{id}                          -> link state
+            # /api/links/{id}/receipts/{receipt_id}    -> audit leaf + proof
+            if len(parts) == 4:
+                link = self._db().get_link(parts[3])
+                if link is None:
+                    self._send_json(404, {"error": "unknown link"})
+                else:
+                    self._send_json(200, link)
+            elif len(parts) == 6 and parts[4] == "receipts":
+                self._get_receipt_audit(parts[3], unquote(parts[5]))
             else:
-                self._send_json(200, link)
+                self._send_json(404, {"error": "not found"})
+        elif path == "/api/audit/root":
+            self._send_json(200, self._db().audit_tip())
         elif path in ("/", "/index.html"):
             self._serve_index()
         else:
@@ -114,6 +124,17 @@ class Handler(BaseHTTPRequestHandler):
         )
         self._send_json(200, verdict)
 
+    def _get_receipt_audit(self, link_id, receipt_id):
+        link = self._db().get_link(link_id)
+        if link is None:
+            self._send_json(404, {"error": "unknown link"})
+            return
+        audit = self._db().get_receipt_audit(receipt_id)
+        if audit is None or audit["link_id"] != link_id:
+            self._send_json(404, {"error": "unknown receipt on this link"})
+            return
+        self._send_json(200, audit)
+
     def _serve_index(self):
         try:
             with open(os.path.join(STATIC_DIR, "index.html"), "rb") as fh:
@@ -135,6 +156,10 @@ class _BadRequest(Exception):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # A burst of concurrent frame submissions may open many sockets at once;
+    # the DB write lock serialises their commits, so give the listen queue
+    # enough room for all of them to connect.
+    request_queue_size = 128
 
     def __init__(self, addr, db_path, log_file=None):
         import sys
